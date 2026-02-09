@@ -1,43 +1,148 @@
 """
-Implementation of contrast limited adaptive histogram equalization (CLAHE) to enhance an input image
+VGG-19 based Grayscale Image Colorization
+Post-processing with CLAHE (Applied AFTER colorization)
 
-Given an RGB image, convert the image to LAB color model and apply CLAHE on lightness channel.
-Convert the CLAHE enhanced image back to RGB space and return the image
+Author: Dr. Gouranga Mandal
 """
+
 import cv2
 import numpy as np
-from PIL import Image
+import matplotlib.pyplot as plt
+from skimage.color import lab2rgb, rgb2lab
+from tensorflow.keras.applications import VGG19
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Conv2D, UpSampling2D, Input
+from tensorflow.keras.optimizers import Adam
 
+# ---------------------------------------------------
+# PARAMETERS
+# ---------------------------------------------------
+IMG_SIZE = 224
+INPUT_IMAGE = "sampleimage.jpg"
+WEIGHTS_PATH = "colorization_vgg19_weights.h5"
+OUTPUT_IMAGE = "final_colorized_clahe.jpg"
 
-def enhance(image_path, clip_limit=3):
-    image = cv2.imread(image_path)
-    # convert image to LAB color model
-    image_lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+# ---------------------------------------------------
+# STEP 1: LOAD GRAYSCALE IMAGE
+# ---------------------------------------------------
+gray = cv2.imread(INPUT_IMAGE, cv2.IMREAD_GRAYSCALE)
+if gray is None:
+    raise FileNotFoundError("Input image not found!")
 
-    # split the image into L, A, and B channels
-    l_channel, a_channel, b_channel = cv2.split(image_lab)
+gray = cv2.resize(gray, (IMG_SIZE, IMG_SIZE))
 
-    # apply CLAHE to lightness channel
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
-    cl = clahe.apply(l_channel)
+L = gray.astype("float32") / 255.0
+L = L * 100.0                         # LAB L-channel range
+L_input = L.reshape(1, IMG_SIZE, IMG_SIZE, 1)
 
-    # merge the CLAHE enhanced L channel with the original A and B channel
-    merged_channels = cv2.merge((cl, a_channel, b_channel))
+# ---------------------------------------------------
+# STEP 2: BUILD VGG-19 COLORIZATION MODEL
+# ---------------------------------------------------
+vgg = VGG19(
+    weights="imagenet",
+    include_top=False,
+    input_shape=(IMG_SIZE, IMG_SIZE, 3)
+)
+vgg.trainable = False
 
-    # convert iamge from LAB color model back to RGB color model
-    final_image = cv2.cvtColor(merged_channels, cv2.COLOR_LAB2BGR)
-    return cv2_to_pil(final_image)
+vgg_features = Model(
+    inputs=vgg.input,
+    outputs=vgg.get_layer("block4_conv4").output
+)
 
+input_L = Input(shape=(IMG_SIZE, IMG_SIZE, 1))
 
-def enhance_cv2(image_path, clip_limit=3):
-    return pil_to_cv2(enhance(image_path, clip_limit=clip_limit))
+# Convert L → pseudo RGB
+x = Conv2D(3, (1, 1), padding="same")(input_L)
 
+features = vgg_features(x)
 
-def cv2_to_pil(cv2_image):
-    return Image.fromarray(cv2.cvtColor(cv2_image, cv2.COLOR_BGR2RGB))
+x = Conv2D(256, (3,3), activation="relu", padding="same")(features)
+x = UpSampling2D((2,2))(x)
 
+x = Conv2D(128, (3,3), activation="relu", padding="same")(x)
+x = UpSampling2D((2,2))(x)
 
-def pil_to_cv2(pil_image):
-    cv2_image = np.array(pil_image)
-    cv2_image = cv2_image[:, :, ::-1].copy()
-    return cv2_image
+x = Conv2D(64, (3,3), activation="relu", padding="same")(x)
+x = UpSampling2D((2,2))(x)
+
+x = Conv2D(32, (3,3), activation="relu", padding="same")(x)
+x = UpSampling2D((2,2))(x)
+
+output_ab = Conv2D(
+    2, (3,3),
+    activation="tanh",
+    padding="same"
+)(x)
+
+model = Model(input_L, output_ab)
+model.compile(optimizer=Adam(1e-4), loss="mse")
+
+# ---------------------------------------------------
+# STEP 3: LOAD TRAINED WEIGHTS
+# ---------------------------------------------------
+model.load_weights(WEIGHTS_PATH)
+
+# ---------------------------------------------------
+# STEP 4: COLORIZE IMAGE USING VGG-19
+# ---------------------------------------------------
+pred_ab = model.predict(L_input)[0]
+pred_ab = pred_ab * 128.0
+
+lab_output = np.zeros((IMG_SIZE, IMG_SIZE, 3))
+lab_output[:,:,0] = L
+lab_output[:,:,1:] = pred_ab
+
+rgb_colorized = lab2rgb(lab_output)
+rgb_colorized_uint8 = (rgb_colorized * 255).astype("uint8")
+
+# ---------------------------------------------------
+# STEP 5: POST-PROCESSING WITH CLAHE (CORRECT PLACE)
+# ---------------------------------------------------
+lab_post = rgb2lab(rgb_colorized_uint8)
+L_post = lab_post[:,:,0].astype("uint8")
+
+clahe = cv2.createCLAHE(
+    clipLimit=2.0,
+    tileGridSize=(8,8)
+)
+
+L_enhanced = clahe.apply(L_post)
+lab_post[:,:,0] = L_enhanced
+
+final_rgb = lab2rgb(lab_post)
+final_rgb = (final_rgb * 255).astype("uint8")
+
+# ---------------------------------------------------
+# STEP 6: SAVE OUTPUT
+# ---------------------------------------------------
+cv2.imwrite(
+    OUTPUT_IMAGE,
+    cv2.cvtColor(final_rgb, cv2.COLOR_RGB2BGR)
+)
+
+# ---------------------------------------------------
+# STEP 7: DISPLAY RESULTS
+# ---------------------------------------------------
+plt.figure(figsize=(12,4))
+
+plt.subplot(1,3,1)
+plt.title("Input Grayscale")
+plt.imshow(gray, cmap="gray")
+plt.axis("off")
+
+plt.subplot(1,3,2)
+plt.title("VGG-19 Colorized")
+plt.imshow(rgb_colorized_uint8)
+plt.axis("off")
+
+plt.subplot(1,3,3)
+plt.title("Colorized + CLAHE (Post)")
+plt.imshow(final_rgb)
+plt.axis("off")
+
+plt.tight_layout()
+plt.show()
+
+print("Colorization completed successfully.")
+print(f"Output saved as: {OUTPUT_IMAGE}")
